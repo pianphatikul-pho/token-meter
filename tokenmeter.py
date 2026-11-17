@@ -1,47 +1,86 @@
-"""tokenmeter: count the tokens that any AI model call uses.
+"""tokenmeter: count, limit and report the tokens that AI model calls use.
 
-One file, standard library only (Python 3.9+, Windows / macOS / Linux). Copy
-it next to your code.
+Everything is in this one file. It needs only Python 3.9 or newer (nothing to
+install) and runs on Windows, macOS and Linux.
 
-    from tokenmeter import TokenMeter
+WHAT IT DOES
+    Every model call goes through the meter. The meter makes the call, reads
+    the token counts out of the model's reply, and saves one row per call in a
+    small database file (the "ledger", token_ledger.db by default). From the
+    ledger you get totals per model, per round or per step, and a CSV for
+    your own analysis. For local models it also enforces a token budget.
+
+RUN IT FROM THE TERMINAL  (on macOS / Linux type python3 instead of python)
+    python tokenmeter.py list                        the planned models
+    python tokenmeter.py check qwen3-30b-a3b         one small real call, to test a connection
+    python tokenmeter.py ask qwen3-30b-a3b "..."     send a prompt and count its tokens
+    python tokenmeter.py report token_ledger.db      token totals
+    python tokenmeter.py export token_ledger.db out.csv
+    python tokenmeter.py --help                      every command and option
+
+USE IT FROM YOUR OWN PYTHON CODE
+    from tokenmeter import TokenMeter, ask, start_run
 
     meter = TokenMeter("token_ledger.db")
-    reply = meter.measure("my-model", lambda: call_my_model(prompt), prompt=prompt, round=1)
-    meter.print_report(by=["model", "round"])
+    budget = start_run(meter, "qwen3-30b-a3b", run="sqli-01/loop/seed-42")
+    reply = ask(meter, "qwen3-30b-a3b", prompt, seed=42, budgets=[budget],
+                run="sqli-01/loop/seed-42", task="SQLI-01", round=1, step="patch")
+    print(reply.text)
 
-The meter sits between your code and the model. It runs the call, reads the
-token counts out of the model's reply, and saves one row per call in a small
-SQLite file (the ledger). It can also hold a token budget and refuse calls
-once the budget is spent.
+    # any other model: wrap your own call
+    reply = meter.measure("my-model", lambda: call_my_model(prompt), prompt=prompt)
 
-How counts are normalized, so every provider means the same thing:
+WHERE TO CHANGE THINGS
+    Add, remove or change a planned model ...... section 1, MODELS
+    Change limits, the budget or the seeds ..... section 1, LOCAL_LIMITS,
+                                                 LOCAL_RUN_TOKEN_BUDGET, LOCAL_SEEDS
+    Change the default Ollama address .......... section 1, OLLAMA_HOST
+    Support a provider whose replies look
+      different (read its token counts) ........ section 4: write one "extractor"
+                                                 function, like the ones there
+    Support a new kind of client (not Ollama,
+      Claude Code or Codex) .................... section 8, ask() and describe()
+    Store an extra column for every call ....... section 2 (table layout) and
+                                                 TokenMeter.record() in section 6
+    Add a terminal command ..................... section 9, main()
+    The parts you will normally never need to touch are sections 2 to 7.
+    After any change, run the tests:  python -m unittest
 
+SECTIONS
+    1. Settings: planned models and limits      (edit here)
+    2. Ledger layout                            (the database tables)
+    3. The usage record                         (one call's token counts)
+    4. Reading token counts from replies        (one "extractor" per provider)
+    5. Token budgets
+    6. The meter                                (records calls, makes reports)
+    7. Talking to models                        (Ollama, OpenAI-style servers, command-line tools)
+    8. The planned models                       (ask, describe, start_run)
+    9. Command line                             (the terminal commands)
+
+WHAT THE NUMBERS MEAN  (the same for every provider)
     input_tokens       everything sent to the model, cached tokens included
-      cache_read_tokens    part of the input that was served from a cache
-      cache_write_tokens   part of the input that was written to a cache
+      cache_read_tokens    the part of the input served from the provider's cache
+      cache_write_tokens   the part of the input written to the cache
     output_tokens      everything generated, reasoning / thinking included
-      reasoning_tokens     part of the output that was reasoning
+      reasoning_tokens     the part of the output that was reasoning
     total_tokens       input_tokens + output_tokens
+    A breakdown is EMPTY (not 0) when the provider does not report it, so
+    "unavailable" is never mistaken for "zero".
 
-A breakdown column is EMPTY (not 0) when the provider does not report it, so
-"unavailable" is never mistaken for "zero".
+    usage_source: where the numbers came from
+        reported    the provider returned them
+        estimated   the provider returned none, so characters / 4 was used
+        none        the call failed or was refused before any usage came back
 
-`usage_source` on each row says where the numbers came from:
-
-    reported    the provider returned them
-    estimated   the provider returned none, so characters / 4 was used
-    none        the call failed or was refused before any usage came back
-
-`flags` on each row lists anything that needs a second look:
-
-    model_mismatch     a different model answered than the one you asked for
-    multiple_models    an agent tool used more than one model in this call
-    output_truncated   the reply was cut off at the output limit
-    input_over_limit   more input tokens than your per-request limit
-    output_at_limit    output reached your per-request limit
-    context_full       input + output filled the context window
-    budget_refused     the call was not made: a budget was already spent
-    over_budget        this call pushed a budget past its limit
+    flags: anything that needs a second look
+        model_mismatch     a different model answered than the one requested
+        multiple_models    an agent tool used more than one model in the call
+        output_truncated   the reply was cut off at the output limit
+        input_over_limit   more input tokens than the per-request limit
+        output_at_limit    output reached the per-request limit
+        context_full       input + output filled the context window
+        budget_refused     the call was not made: a budget was already spent
+        over_budget        this call pushed a budget past its limit
 """
 
 from __future__ import annotations
@@ -49,6 +88,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import platform
 import shutil
 import sqlite3
 import subprocess
@@ -60,26 +100,126 @@ import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Iterator, Optional, Sequence
+from typing import Any, Callable, Iterator, NamedTuple, Optional, Sequence
 
-__version__ = "1.1.0"
+__version__ = "2.0.0"
 
+
+# =============================================================================
+# 1. SETTINGS: PLANNED MODELS AND LIMITS                          (edit here)
+#
+# These are the Chapter 3 settings. Change them here and everything else
+# follows: requests, budgets, configuration records and the `list` command.
+# =============================================================================
+
+# Where Ollama listens. Ollama's own default; change it if yours is elsewhere.
+# Every command that talks to Ollama also accepts --host to override it.
+OLLAMA_HOST = "http://localhost:11434"
+
+# Per-request limits for local (Ollama) models: the context window, and the
+# most input and output tokens one request may use. The output limit is sent
+# to the model; the input limit is checked after the call and flagged.
+LOCAL_LIMITS = {"context_window": 16_384, "max_input_tokens": 8_192, "max_output_tokens": 8_192}
+
+# Token budget for one run of a local model: input + output tokens across all
+# repair and prompt-refinement requests. Requests are refused once it is spent.
+LOCAL_RUN_TOKEN_BUDGET = 120_000
+
+# One seed per repetition (local models only; cloud clients have no seed).
+LOCAL_SEEDS = (42, 43, 44)
+
+# The quantization every local model file is expected to have. The
+# configuration record says whether the installed file matches.
+EXPECTED_QUANTIZATION = "Q4_K_M"
+
+# Sampling settings shared by more than one model.
+QWEN_14B_SAMPLING = {"temperature": 0.2, "top_p": 0.9, "top_k": 40}
+QWEN_30B_SAMPLING = {"temperature": 0.6, "top_p": 0.95, "top_k": 20}
+
+# The planned model-and-agent configurations.
+#
+# Each entry is   "short-name": {settings}   and the short name is what you
+# type in commands (python tokenmeter.py check short-name).
+#
+#   client     how the model is reached:
+#                "ollama"       a local model through Ollama
+#                "claude-code"  Claude through the Claude Code command-line tool
+#                "codex"        GPT through the Codex command-line tool
+#   model      the exact model name that client expects
+#   effort     (claude-code, codex) reasoning effort; "Extra High" is "xhigh"
+#   think      (ollama) True for thinking models such as Qwen3; None for models
+#              that cannot think (Ollama rejects the setting for them)
+#   sampling   (ollama) temperature, top_p and top_k
+#
+# To ADD a model, copy an entry of the same client and change the short name
+# and "model". For a new Ollama model, also run `ollama pull <model>` first.
+MODELS: dict = {
+    # GPT through Codex. TODO: confirm these two model names with Codex itself;
+    # they are written as the plan names them.
+    "gpt-6-astra": {"client": "codex", "model": "gpt-6-astra", "effort": "xhigh"},
+    "gpt-6-luna": {"client": "codex", "model": "gpt-6-luna", "effort": "xhigh"},
+
+    # Claude through Claude Code.
+    "claude-opus-5-5": {"client": "claude-code", "model": "claude-opus-5-5", "effort": "xhigh"},
+    "claude-sonnet-5-5": {"client": "claude-code", "model": "claude-sonnet-5-5", "effort": "xhigh"},
+    "claude-haiku-5-5": {"client": "claude-code", "model": "claude-haiku-5-5", "effort": "xhigh"},
+
+    # Qwen through Ollama, Q4_K_M files. Tags checked on ollama.com on 2026-11-17.
+    "qwen2.5-14b-instruct": {
+        "client": "ollama", "model": "qwen2.5:14b-instruct-q4_K_M", "think": None, "sampling": QWEN_14B_SAMPLING,
+    },
+    "qwen2.5-coder-14b-instruct": {
+        "client": "ollama", "model": "qwen2.5-coder:14b-instruct-q4_K_M", "think": None,
+        "sampling": QWEN_14B_SAMPLING,
+    },
+    # Plain `qwen3:30b` is a DIFFERENT file (the later "thinking-2507"
+    # release). This tag is the original Qwen3-30B-A3B at Q4_K_M.
+    "qwen3-30b-a3b": {
+        "client": "ollama", "model": "qwen3:30b-a3b-q4_K_M", "think": True, "sampling": QWEN_30B_SAMPLING,
+    },
+}
+
+# The ledger file used when a command is not given one.
+DEFAULT_LEDGER = "token_ledger.db"
+
+# When a provider sends no token counts at all, tokens are estimated as
+# characters divided by this, and the row is marked "estimated".
 CHARS_PER_TOKEN_ESTIMATE = 4
+
+
+# =============================================================================
+# 2. LEDGER LAYOUT
+#
+# The ledger is a normal SQLite file. It opens in any SQLite viewer, pandas
+# or R. Tables:
+#   calls           one row per model call (the main table)
+#   budgets         each token budget and its limit
+#   budget_charges  which call was charged to which budget
+#   configs         configuration records saved at the start of each run
+#
+# To store an extra column for every call: add it to _CALLS_TABLE and to
+# _CALL_COLUMNS, then fill it in TokenMeter.record() (section 6). Ledgers
+# made by older versions are upgraded automatically when opened.
+# =============================================================================
+
 UNAVAILABLE = "unavailable"
 
-# Labels you can attach to a call and group reports by.
+# The labels you can attach to a call (and group reports by).
 CONTEXT_COLUMNS = ("experiment", "run", "task", "round", "step")
 GROUP_COLUMNS = ("model", "provider", "reported_model") + CONTEXT_COLUMNS + ("usage_source", "stop_reason")
+# Totals that always exist, and breakdowns a provider may not report.
 ALWAYS_KNOWN = ("input_tokens", "output_tokens", "total_tokens", "seconds", "prompt_chars", "response_chars")
 MAY_BE_UNAVAILABLE = ("cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "reasoning_chars", "cost_usd")
 SUM_COLUMNS = (
     "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens",
     "total_tokens", "cost_usd", "seconds", "prompt_chars", "response_chars", "reasoning_chars",
 )
+# The columns of the CSV export, in order.
 CSV_COLUMNS = (
     ("call_id", "time_utc", "model", "reported_model", "provider") + CONTEXT_COLUMNS + SUM_COLUMNS
     + ("usage_source", "stop_reason", "flags", "error", "tags")
 )
+# Stop reasons that mean "the reply was cut off" (flagged output_truncated).
 TRUNCATED_STOP_REASONS = {"length", "max_tokens", "max_output_tokens", "model_context_window_exceeded"}
 
 _CALLS_TABLE = """
@@ -132,14 +272,18 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-# --------------------------------------------------------------------- usage
+# =============================================================================
+# 3. THE USAGE RECORD
+#
+# A Usage holds one call's token counts after they have been converted to the
+# common meaning described at the top of this file. Extractors (section 4)
+# produce it; the meter (section 6) stores it.
+# =============================================================================
 
 @dataclass
 class Usage:
-    """Token counts for one call, already normalized (see the module docstring).
-
-    Leave a breakdown field as None when the provider does not report it.
-    """
+    """Token counts for one call. Leave a breakdown as None when the provider
+    does not report it."""
 
     input_tokens: int = 0
     output_tokens: int = 0
@@ -193,11 +337,16 @@ def _text(value: Any) -> Optional[str]:
     return str(value) if value not in (None, "") else None
 
 
-# ----------------------------------------------------- provider extractors
+# =============================================================================
+# 4. READING TOKEN COUNTS FROM REPLIES
 #
-# An extractor takes whatever the model call returned and gives back a Usage,
-# or None if the reply carried no token counts. To support a new provider,
-# write one more function like these and pass it as `extract=`.
+# Every provider reports tokens in its own format. An "extractor" turns one
+# provider's reply into a Usage, or returns None if the reply has no counts.
+#
+# To support a provider not listed here, write one more function like these
+# and pass it to measure() as extract=your_function. detect() picks the right
+# built-in extractor automatically.
+# =============================================================================
 
 def from_openai(response: Any) -> Optional[Usage]:
     """OpenAI and OpenAI-compatible servers (Chat Completions or Responses API).
@@ -340,7 +489,7 @@ def from_codex_jsonl(output: Any) -> Optional[Usage]:
     """The event lines printed by `codex exec --json`.
 
     NOT VERIFIED against a live Codex CLI: check one real output before
-    relying on it.
+    relying on it (python tokenmeter.py check gpt-6-astra).
     """
     if not isinstance(output, str):
         return None
@@ -389,8 +538,8 @@ def codex_final_message(output: str) -> str:
 def detect(response: Any) -> Optional[Usage]:
     """Work out which provider a reply came from and read its usage.
 
-    Good enough for the formats above. Pass a specific extractor if you know
-    which one you need, or your own function for anything else.
+    This is the default extractor. Pass a specific one if you know which you
+    need, or your own function for anything else.
     """
     if isinstance(response, Usage):
         return response
@@ -465,7 +614,16 @@ def same_model(requested: str, reported: str) -> bool:
     return False
 
 
-# ------------------------------------------------------------------- budgets
+# =============================================================================
+# 5. TOKEN BUDGETS
+#
+# A budget is a token allowance stored in the ledger. measure() checks it
+# BEFORE each call and refuses the call when nothing is left. It cannot stop a
+# call that is already running, so one call can overshoot by at most its own
+# size (cap the output with output_allowance() to keep that small). For agent
+# tools that make many model turns inside one call, a budget is a stop rule
+# between calls, not an exact limit.
+# =============================================================================
 
 class BudgetExceeded(RuntimeError):
     """Raised instead of making a call when a budget has nothing left."""
@@ -476,14 +634,7 @@ class BudgetExceeded(RuntimeError):
 
 
 class Budget:
-    """A token allowance stored in the ledger. Get one from `meter.budget()`.
-
-    The meter checks it BEFORE each call and refuses the call when nothing is
-    left. It cannot stop a call that is already running, so one call can still
-    overshoot: cap the output yourself with `max_output()`. For agent tools
-    that make many model turns inside one call, treat this as a stop rule
-    between calls, not an exact limit.
-    """
+    """One token budget. Get one from meter.budget(name, limit)."""
 
     def __init__(self, meter: "TokenMeter", name: str, limit: int):
         self.meter, self.name, self.limit = meter, name, int(limit)
@@ -513,20 +664,27 @@ def output_allowance(budgets: Sequence[Budget], cap: int) -> int:
     return min([int(cap)] + [b.remaining() for b in budgets])
 
 
-# --------------------------------------------------------------------- meter
+# =============================================================================
+# 6. THE METER
+#
+# TokenMeter is the middleman. measure() makes a call and records it;
+# record() stores numbers you already have; the reading methods (rows,
+# summary, report, export_csv) turn the ledger into results.
+# =============================================================================
 
 class TokenMeter:
-    """The middleman. Create one per ledger file and send every call through it.
+    """Create one per ledger file and send every call through it.
 
     path     the SQLite ledger file (created if missing). ":memory:" keeps
              nothing on disk.
     prices   optional {model: (input_usd_per_million, output_usd_per_million)},
-             used for cost when the provider does not report one.
+             used for cost when the provider does not report one. This prices
+             cached input the same as normal input.
     context  default labels for every call: experiment, run, task, round, step.
              Any other name is stored as a tag.
     """
 
-    def __init__(self, path: str = "token_ledger.db", prices: Optional[dict] = None, **context: Any):
+    def __init__(self, path: str = DEFAULT_LEDGER, prices: Optional[dict] = None, **context: Any):
         self.path = str(path)
         self.prices = dict(prices or {})
         self._context = dict(context)
@@ -623,7 +781,7 @@ class TokenMeter:
         """Write one call to the ledger and return the stored row.
 
         Use this directly when you already have the numbers (for example after
-        a streamed reply finishes). Otherwise use `measure`.
+        a streamed reply finishes). Otherwise use measure().
 
         budgets  budgets to charge this call's total tokens to
         limits   optional per-request limits to check the call against:
@@ -644,6 +802,7 @@ class TokenMeter:
             price_in, price_out = self.prices[model]
             cost = (usage.input_tokens * price_in + usage.output_tokens * price_out) / 1_000_000
 
+        # Flags: anything about this call that needs a second look.
         found = list(flags)
         if usage.model:
             if not same_model(model, usage.model):
@@ -716,20 +875,20 @@ class TokenMeter:
         limits: Optional[dict] = None,
         **labels: Any,
     ) -> Any:
-        """Run `call()`, record what it used, and return its result unchanged.
+        """Run call(), record what it used, and return its result unchanged.
 
         call     a function with no arguments that makes the model call,
                  usually a lambda
-        extract  how to read token counts from the result. The default
-                 recognizes OpenAI, Anthropic, Ollama, Gemini, Claude Code
-                 and Codex output.
+        extract  how to read token counts from the result (section 4). The
+                 default recognizes OpenAI, Anthropic, Ollama, Gemini, Claude
+                 Code and Codex output.
         prompt   what you sent (text or messages), for the size in characters
                  and for the estimate when no counts come back
         text     optional function returning the reply text from the result
         budgets  budgets to check before the call and charge after it. If any
                  is already spent, the call is NOT made: the refusal is
                  recorded and BudgetExceeded is raised.
-        limits   per-request limits to flag (see `record`)
+        limits   per-request limits to flag (see record)
 
         If the call raises, the failure is recorded and the error is raised
         again, so your own error handling still works.
@@ -756,8 +915,8 @@ class TokenMeter:
     def wrap(self, function: Callable[..., Any], model: str, **options: Any) -> Callable[..., Any]:
         """Turn any function that calls a model into a metered one.
 
-            ask = meter.wrap(ask_my_model, "my-model")
-            ask("hello")          # counted
+            ask_it = meter.wrap(ask_my_model, "my-model")
+            ask_it("hello")          # counted
 
         The first positional argument is taken as the prompt.
         """
@@ -807,9 +966,8 @@ class TokenMeter:
         return [dict(r) for r in found]
 
     def summary(self, by: Sequence[str] = ("model",), **filters: Any) -> list[dict]:
-        """Totals grouped by any of: model, provider, reported_model,
-        experiment, run, task, round, step. A total is None when no call in
-        the group reported that number."""
+        """Totals grouped by any of GROUP_COLUMNS (section 2). A total is None
+        when no call in the group reported that number."""
         by = [by] if isinstance(by, str) else list(by)
         for name in by:
             if name not in GROUP_COLUMNS:
@@ -885,10 +1043,12 @@ class TokenMeter:
         self.close()
 
 
-# ------------------------------------------------------ ready-made callers
+# =============================================================================
+# 7. TALKING TO MODELS
 #
-# Small helpers so you can talk to a model with nothing installed. They return
-# the provider's reply; pass them to `meter.measure`.
+# Small helpers that make the actual requests, using only Python's standard
+# library. They return the provider's reply; pass them to meter.measure().
+# =============================================================================
 
 def _http(request: urllib.request.Request, timeout: float) -> dict:
     try:
@@ -914,7 +1074,7 @@ def get_json(url: str, timeout: float = 10.0) -> dict:
     return _http(urllib.request.Request(url, method="GET"), timeout)
 
 
-def ollama_chat(model: str, prompt: str, system: Optional[str] = None, host: str = "http://localhost:11434",
+def ollama_chat(model: str, prompt: str, system: Optional[str] = None, host: str = OLLAMA_HOST,
                 think: Any = None, timeout: float = 3600.0, **options: Any) -> dict:
     """One chat turn with a local Ollama model.
 
@@ -932,7 +1092,7 @@ def ollama_chat(model: str, prompt: str, system: Optional[str] = None, host: str
     return post_json(f"{host.rstrip('/')}/api/chat", payload, timeout=timeout)
 
 
-def ollama_gpu_percent(model: str, host: str = "http://localhost:11434") -> Optional[float]:
+def ollama_gpu_percent(model: str, host: str = OLLAMA_HOST) -> Optional[float]:
     """Share of the loaded model that sits on the GPU (100 = fully offloaded,
     0 = CPU only), from Ollama's list of running models. None if unknown."""
     try:
@@ -945,7 +1105,7 @@ def ollama_gpu_percent(model: str, host: str = "http://localhost:11434") -> Opti
     return None
 
 
-def ollama_model_info(model: str, host: str = "http://localhost:11434") -> dict:
+def ollama_model_info(model: str, host: str = OLLAMA_HOST) -> dict:
     """What exactly is being run: Ollama version, the model file's digest
     (its hash), quantization, parameter size and current GPU offload.
     Anything that cannot be read is reported as "unavailable"."""
@@ -1016,54 +1176,387 @@ def cli_version(program: str) -> str:
                                   errors="replace", timeout=30)
     except Exception:
         return UNAVAILABLE
-    return (finished.stdout or finished.stderr).strip().splitlines()[0] if (finished.stdout or finished.stderr).strip() else UNAVAILABLE
+    output = (finished.stdout or finished.stderr or "").strip()
+    return output.splitlines()[0] if output else UNAVAILABLE
 
 
-# ----------------------------------------------------------------------- CLI
+# =============================================================================
+# 8. THE PLANNED MODELS
+#
+# ask() sends one request to a model from MODELS (section 1), through the
+# meter, with that model's settings and limits applied. describe() builds the
+# configuration record, and start_run() saves it at the start of a run.
+#
+# To support a new kind of client, add a branch for it in ask() and in
+# describe(), and use its name as "client" in MODELS.
+# =============================================================================
+
+NOT_CONFIGURABLE = "not configurable (managed by the client)"
+CLIENT_DEFAULT = "client-managed default"
+
+# The program each command-line client runs.
+_CLI_PROGRAM = {"codex": "codex", "claude-code": "claude"}
+
+
+class Reply(NamedTuple):
+    text: str  # what the model answered
+    raw: Any  # the provider's full reply
+
+
+def _plan(key: str) -> dict:
+    if key not in MODELS:
+        raise KeyError(f"unknown model {key!r}; choose one of: {', '.join(MODELS)}")
+    return MODELS[key]
+
+
+def ask(
+    meter: TokenMeter,
+    key: str,
+    prompt: str,
+    *,
+    system: Optional[str] = None,
+    seed: Optional[int] = None,
+    budgets: Sequence[Budget] = (),
+    workdir: Optional[str] = None,
+    allow_edits: bool = False,
+    host: str = OLLAMA_HOST,
+    timeout: float = 3600.0,
+    **labels: Any,
+) -> Reply:
+    """Send one request to a planned model, through the meter.
+
+    key          a short name from MODELS, e.g. "qwen3-30b-a3b"
+    system       optional instructions sent before the prompt
+    seed         used for local models (42, 43, 44 in the plan). Codex and
+                 Claude Code have no seed control; it is stored as a label only.
+    budgets      checked before the request and charged after it. For local
+                 models the output limit sent to the model is the per-request
+                 limit or whatever the budgets have left, whichever is smaller.
+    workdir      folder the coding agent works in (Codex / Claude Code)
+    allow_edits  let the coding agent change files in workdir
+    labels       experiment, run, task, round, step, and anything else to store
+
+    If the model was downgraded after hitting a usage limit, call this with
+    the downgraded model's key and add downgraded_from="<key>".
+    """
+    plan = _plan(key)
+    model, client = plan["model"], plan["client"]
+    labels = {"config": key, "seed": seed, **labels}
+
+    if client == "ollama":
+        num_predict = output_allowance(budgets, LOCAL_LIMITS["max_output_tokens"])
+        options = {**plan["sampling"], "num_ctx": LOCAL_LIMITS["context_window"], "num_predict": max(num_predict, 1)}
+        if seed is not None:
+            options["seed"] = seed
+
+        def call_ollama() -> dict:
+            reply = ollama_chat(model, prompt, system=system, host=host, think=plan["think"],
+                                timeout=timeout, **options)
+            gpu = ollama_gpu_percent(model, host)  # how much of the model is on the GPU right now
+            reply["_gpu_percent"] = gpu if gpu is not None else UNAVAILABLE
+            return reply
+
+        def read_ollama(reply: dict) -> Optional[Usage]:
+            usage = from_ollama(reply)
+            if usage is not None:
+                usage.tags.update(gpu_percent=reply["_gpu_percent"], num_predict=options["num_predict"],
+                                  thinking=bool(plan["think"]))
+            return usage
+
+        raw = meter.measure(model, call_ollama, extract=read_ollama, prompt=[system, prompt], provider="ollama",
+                            budgets=budgets, limits=LOCAL_LIMITS, **labels)
+        return Reply(guess_text(raw), raw)
+
+    # Coding-agent clients get the system text and the prompt as one input on
+    # standard input, so every model receives the same words.
+    full_prompt = f"{system}\n\n{prompt}" if system else prompt
+    labels["effort"] = plan["effort"]
+
+    if client == "claude-code":
+        command = ["claude", "-p", "--output-format", "json", "--model", model, "--effort", plan["effort"],
+                   "--permission-mode", "acceptEdits" if allow_edits else "plan", "--no-session-persistence"]
+        raw = meter.measure(
+            model, lambda: json.loads(run_cli(command, full_prompt, cwd=workdir, timeout=timeout)),
+            extract=from_claude_code, prompt=full_prompt, provider="claude-code", budgets=budgets, **labels,
+        )
+        if raw.get("is_error"):  # the tokens are already recorded above
+            raise RuntimeError(f"Claude Code reported an error: {str(raw.get('result'))[:500]}")
+        return Reply(str(raw.get("result") or ""), raw)
+
+    if client == "codex":
+        # NOT VERIFIED against a live Codex CLI (flags and output format).
+        command = ["codex", "exec", "--json", "--model", model, "-c", f"model_reasoning_effort={plan['effort']}",
+                   "--sandbox", "workspace-write" if allow_edits else "read-only", "-"]
+        raw = meter.measure(
+            model, lambda: run_cli(command, full_prompt, cwd=workdir, timeout=timeout),
+            extract=from_codex_jsonl, text=codex_final_message, prompt=full_prompt, provider="codex",
+            budgets=budgets, **labels,
+        )
+        return Reply(codex_final_message(raw), raw)
+
+    raise ValueError(f"no access path for client {client!r}")
+
+
+def describe(key: str, host: str = OLLAMA_HOST) -> dict:
+    """The configuration record for one planned model: exact model name,
+    model-file hash, client and inference-service versions, and every setting,
+    with controls the client does not expose marked as such."""
+    plan = _plan(key)
+    record: dict = {
+        "config": key,
+        "client": plan["client"],
+        "model": plan["model"],
+        "tokenmeter_version": __version__,
+        "platform": platform.platform(),
+        "python_version": platform.python_version(),
+    }
+    if plan["client"] == "ollama":
+        info = ollama_model_info(plan["model"], host)
+        quantization = info.get("quantization_level")
+        record.update(info)
+        record.update({
+            "expected_quantization": EXPECTED_QUANTIZATION,
+            "quantization_matches": (quantization == EXPECTED_QUANTIZATION) if quantization != UNAVAILABLE else UNAVAILABLE,
+            "thinking": bool(plan["think"]),
+            **plan["sampling"],
+            "seed": f"set per run: {', '.join(map(str, LOCAL_SEEDS))}",
+            "context_window": LOCAL_LIMITS["context_window"],
+            "max_input_tokens_per_request": LOCAL_LIMITS["max_input_tokens"],
+            "max_output_tokens_per_request": LOCAL_LIMITS["max_output_tokens"],
+            "run_token_budget": LOCAL_RUN_TOKEN_BUDGET,
+            "token_limit_enforcement": "enforced by the meter: checked before each request, output capped per request",
+        })
+    else:
+        record.update({
+            "client_version": cli_version(_CLI_PROGRAM[plan["client"]]),
+            "reasoning_effort": plan["effort"],
+            "temperature": NOT_CONFIGURABLE,
+            "top_p": NOT_CONFIGURABLE,
+            "top_k": NOT_CONFIGURABLE,
+            "seed": NOT_CONFIGURABLE,
+            "context_window": CLIENT_DEFAULT,
+            "max_output_tokens_per_request": CLIENT_DEFAULT,
+            "token_limit_enforcement": "recorded only: usage is counted per request, no exact limit is enforced inside one",
+        })
+    return record
+
+
+def start_run(meter: TokenMeter, key: str, run: str, host: str = OLLAMA_HOST) -> Optional[Budget]:
+    """Call once at the start of each run. Saves the configuration record and,
+    for local models, returns the run's token budget (None for cloud models,
+    whose usage is recorded but not limited)."""
+    meter.save_config(key, {"run": run, **describe(key, host)})
+    if _plan(key)["client"] == "ollama":
+        return meter.budget(f"{run}/repair", LOCAL_RUN_TOKEN_BUDGET)
+    return None
+
+
+def _continue_run(meter: TokenMeter, key: str, run: str, host: str) -> Optional[Budget]:
+    """start_run() the first time a run name is used in this ledger; after
+    that, reopen the same budget without saving the record again."""
+    if not any(c["config"].get("run") == run for c in meter.configs(key)):
+        return start_run(meter, key, run, host)
+    if _plan(key)["client"] == "ollama":
+        return meter.budget(f"{run}/repair")
+    return None
+
+
+# =============================================================================
+# 9. COMMAND LINE
+#
+# Each command is one small function below, and main() connects the words
+# you type to them. To add a command: write a function like these, then add a
+# parser for it in main().
+# =============================================================================
+
+def _cmd_list(args: argparse.Namespace) -> int:
+    for key, plan in MODELS.items():
+        extra = f"effort {plan['effort']}" if "effort" in plan else (
+            ", ".join(f"{k} {v}" for k, v in plan["sampling"].items()) + (", thinking on" if plan["think"] else ""))
+        print(f"{key:<28} {plan['client']:<12} {plan['model']:<36} {extra}")
+    return 0
+
+
+def _cmd_describe(args: argparse.Namespace) -> int:
+    print(json.dumps(describe(args.key, args.host), indent=2))
+    return 0
+
+
+def _cmd_check(args: argparse.Namespace) -> int:
+    """One small real call, to confirm the connection reports tokens."""
+    with TokenMeter(args.ledger, experiment="meter-check") as meter:
+        meter.save_config(args.key, describe(args.key, args.host))
+        try:
+            reply = ask(meter, args.key, "Reply with the single word: ready", seed=args.seed, host=args.host,
+                        step="check")
+        except Exception as exc:
+            print(f"The call failed: {exc}")
+            return 1
+        row = meter.rows(experiment="meter-check")[-1]
+    print(f"reply: {reply.text.strip()[:200]}\n")
+    for name in ("model", "reported_model", "usage_source", "input_tokens", "cache_read_tokens",
+                 "cache_write_tokens", "output_tokens", "reasoning_tokens", "reasoning_chars", "total_tokens",
+                 "cost_usd", "seconds", "stop_reason", "flags", "tags"):
+        value = row[name]
+        print(f"  {name:<20} {'(unavailable)' if value is None else value}")
+    print("\nRaw usage from the provider (compare with the numbers above):")
+    print(json.dumps(json.loads(row["raw_usage"]), indent=2)[:3000])
+    if row["usage_source"] != "reported":
+        print("\nWARNING: no token counts came back. Fix this connection before collecting data.")
+        return 1
+    if row["flags"]:
+        print(f"\nCheck the flags: {row['flags']}")
+    return 0
+
+
+def _read_text(value: Optional[str], path: Optional[str], what: str) -> Optional[str]:
+    if value is not None and path is not None:
+        raise SystemExit(f"give the {what} as text or as a file, not both")
+    if path is not None:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    return value
+
+
+def _cmd_ask(args: argparse.Namespace) -> int:
+    """Send one prompt to a planned model and count its tokens. The reply goes
+    to the screen (or --out), the token summary to the error stream."""
+    prompt = _read_text(args.prompt, args.prompt_file, "prompt")
+    if prompt is None:
+        if sys.stdin is None or sys.stdin.isatty():
+            raise SystemExit("give a prompt: as text, with --prompt-file, or piped in")
+        prompt = sys.stdin.read()
+    system = _read_text(None, args.system_file, "system text")
+    labels = {name: getattr(args, name) for name in ("experiment", "run", "task", "round", "step")
+              if getattr(args, name) is not None}
+    with TokenMeter(args.ledger) as meter:
+        budget = _continue_run(meter, args.key, args.run, args.host) if args.run else None
+        try:
+            reply = ask(meter, args.key, prompt, system=system, seed=args.seed,
+                        budgets=[budget] if budget else [], workdir=args.workdir,
+                        allow_edits=args.allow_edits, host=args.host, **labels)
+        except BudgetExceeded as exc:
+            print(f"Not sent: {exc}", file=sys.stderr)
+            return 2
+        except Exception as exc:
+            print(f"The call failed: {exc}", file=sys.stderr)
+            return 1
+        row = meter.rows()[-1]
+        left = f" · budget left {budget.remaining():,}" if budget else ""
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as handle:
+            handle.write(reply.text)
+    else:
+        print(reply.text)
+    sys.stdout.flush()  # the reply first, then the token summary
+    print(f"[tokenmeter] {args.key}: input {row['input_tokens']:,}, output {row['output_tokens']:,}, "
+          f"total {row['total_tokens']:,} tokens ({row['usage_source']}){left} · "
+          f"flags: {row['flags'] or 'none'}", file=sys.stderr)
+    return 0
+
+
+def _cmd_report(args: argparse.Namespace) -> int:
+    filters = {}
+    for item in args.where:
+        name, _, value = item.partition("=")
+        filters[name] = int(value) if name == "round" and value.lstrip("-").isdigit() else value
+    with TokenMeter(args.ledger) as meter:
+        meter.print_report(by=args.by, **filters)
+    return 0
+
+
+def _cmd_export(args: argparse.Namespace) -> int:
+    with TokenMeter(args.ledger) as meter:
+        print(f"wrote {meter.export_csv(args.csv)} calls to {args.csv}")
+    return 0
+
+
+def _cmd_budgets(args: argparse.Namespace) -> int:
+    with TokenMeter(args.ledger) as meter:
+        rows = meter.budgets()
+    if not rows:
+        print("No budgets in this ledger.")
+    for row in rows:
+        print(f"{row['name']}: used {row['used_tokens']:,} of {row['limit_tokens']:,} tokens "
+              f"({row['remaining_tokens']:,} left, {row['calls']} calls)")
+    return 0
+
+
+def _cmd_configs(args: argparse.Namespace) -> int:
+    with TokenMeter(args.ledger) as meter:
+        print(json.dumps(meter.configs(), indent=2))
+    return 0
+
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(prog="tokenmeter", description="Read a token ledger.")
-    commands = parser.add_subparsers(dest="command", required=True)
+    parser = argparse.ArgumentParser(
+        prog="tokenmeter",
+        description="Count, limit and report the tokens that AI model calls use.",
+        epilog="On macOS and Linux, type python3 instead of python.",
+    )
+    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+    model_keys = list(MODELS)
 
-    report = commands.add_parser("report", help="print token totals")
-    report.add_argument("ledger")
-    report.add_argument("--by", nargs="+", default=["model"], choices=GROUP_COLUMNS, metavar="COLUMN",
-                        help=f"group by any of: {', '.join(GROUP_COLUMNS)}")
-    report.add_argument("--where", nargs="*", default=[], metavar="COLUMN=VALUE",
-                        help="only calls matching these, e.g. --where model=qwen3:30b round=2")
+    # ---- the planned models
+    command = commands.add_parser("list", help="show the planned models and their settings")
+    command.set_defaults(run_command=_cmd_list)
 
-    export = commands.add_parser("export", help="write every call to a CSV file")
-    export.add_argument("ledger")
-    export.add_argument("csv")
+    command = commands.add_parser("describe", help="print the configuration record for one model")
+    command.add_argument("key", choices=model_keys, metavar="MODEL")
+    command.add_argument("--host", default=OLLAMA_HOST, help="Ollama address (local models)")
+    command.set_defaults(run_command=_cmd_describe)
 
-    budgets = commands.add_parser("budgets", help="show each token budget and what it has used")
-    budgets.add_argument("ledger")
+    command = commands.add_parser("check", help="make one small real call and show what was recorded")
+    command.add_argument("key", choices=model_keys, metavar="MODEL")
+    command.add_argument("--ledger", default=DEFAULT_LEDGER)
+    command.add_argument("--seed", type=int, default=LOCAL_SEEDS[0])
+    command.add_argument("--host", default=OLLAMA_HOST, help="Ollama address (local models)")
+    command.set_defaults(run_command=_cmd_check)
 
-    configs = commands.add_parser("configs", help="print the saved model configuration records")
-    configs.add_argument("ledger")
+    command = commands.add_parser("ask", help="send a prompt to a planned model and count its tokens")
+    command.add_argument("key", choices=model_keys, metavar="MODEL")
+    command.add_argument("prompt", nargs="?", help="the prompt (or use --prompt-file, or pipe it in)")
+    command.add_argument("--prompt-file", help="read the prompt from this text file")
+    command.add_argument("--system-file", help="read instructions to send before the prompt from this file")
+    command.add_argument("--out", help="write the reply to this file instead of the screen")
+    command.add_argument("--ledger", default=DEFAULT_LEDGER)
+    command.add_argument("--run", help="run name; for local models this also applies the run's token budget")
+    command.add_argument("--experiment")
+    command.add_argument("--task")
+    command.add_argument("--round", type=int)
+    command.add_argument("--step")
+    command.add_argument("--seed", type=int, help="local models only, e.g. 42, 43 or 44")
+    command.add_argument("--host", default=OLLAMA_HOST, help="Ollama address (local models)")
+    command.add_argument("--workdir", help="folder a coding agent (Codex, Claude Code) works in")
+    command.add_argument("--allow-edits", action="store_true", help="let a coding agent change files in --workdir")
+    command.set_defaults(run_command=_cmd_ask)
+
+    # ---- reading a ledger
+    command = commands.add_parser("report", help="print token totals from a ledger")
+    command.add_argument("ledger")
+    command.add_argument("--by", nargs="+", default=["model"], choices=GROUP_COLUMNS, metavar="COLUMN",
+                         help=f"group by any of: {', '.join(GROUP_COLUMNS)}")
+    command.add_argument("--where", nargs="*", default=[], metavar="COLUMN=VALUE",
+                         help="only calls matching these, e.g. --where model=qwen3:30b-a3b-q4_K_M round=2")
+    command.set_defaults(run_command=_cmd_report)
+
+    command = commands.add_parser("export", help="write every call in a ledger to a CSV file")
+    command.add_argument("ledger")
+    command.add_argument("csv")
+    command.set_defaults(run_command=_cmd_export)
+
+    command = commands.add_parser("budgets", help="show each token budget and what it has used")
+    command.add_argument("ledger")
+    command.set_defaults(run_command=_cmd_budgets)
+
+    command = commands.add_parser("configs", help="print the saved configuration records")
+    command.add_argument("ledger")
+    command.set_defaults(run_command=_cmd_configs)
 
     args = parser.parse_args(argv)
-    if hasattr(sys.stdout, "reconfigure"):  # never crash a report on a Windows console
+    if hasattr(sys.stdout, "reconfigure"):  # a reply may hold characters a Windows console cannot show
         sys.stdout.reconfigure(errors="replace")
-    with TokenMeter(args.ledger) as meter:
-        if args.command == "report":
-            filters = {}
-            for item in args.where:
-                name, _, value = item.partition("=")
-                filters[name] = int(value) if name == "round" and value.lstrip("-").isdigit() else value
-            meter.print_report(by=args.by, **filters)
-        elif args.command == "export":
-            print(f"wrote {meter.export_csv(args.csv)} calls to {args.csv}")
-        elif args.command == "budgets":
-            rows = meter.budgets()
-            if not rows:
-                print("No budgets in this ledger.")
-            for row in rows:
-                print(f"{row['name']}: used {row['used_tokens']:,} of {row['limit_tokens']:,} tokens "
-                      f"({row['remaining_tokens']:,} left, {row['calls']} calls)")
-        else:
-            print(json.dumps(meter.configs(), indent=2))
-    return 0
+    return args.run_command(args)
 
 
 if __name__ == "__main__":

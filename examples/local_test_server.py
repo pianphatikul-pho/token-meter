@@ -11,7 +11,7 @@ It answers on http://127.0.0.1:11435 in the same formats as:
 
 Its replies are canned text and its token counts are made up (about one token
 per four characters). It only exists so you can check that the meter, the
-budget, the reports and planned_models.py work end to end before you point
+budget, the reports and the planned models in tokenmeter.py work end to end before you point
 them at a real model. Never use its numbers as results.
 
 Options:

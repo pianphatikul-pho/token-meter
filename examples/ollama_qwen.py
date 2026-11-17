@@ -10,7 +10,7 @@ address:
 
 Records to token_ledger.db in the current folder. For the three Qwen
 configurations in the project plan, with their exact settings, budget and
-limits already applied, use planned_models.py instead.
+limits already applied, use tokenmeter.py itself: python tokenmeter.py ask MODEL "prompt".
 """
 
 import sys

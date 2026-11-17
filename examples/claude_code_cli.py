@@ -12,7 +12,7 @@ input, so expect larger numbers than a plain API call with the same prompt.
 
 For Codex, run ["codex", "exec", "--json", "-"] the same way and use
 `extract=from_codex_jsonl` (not yet verified against a live Codex CLI).
-The planned GPT and Claude configurations are ready-made in planned_models.py.
+The planned GPT and Claude models are ready-made in tokenmeter.py: python tokenmeter.py ask MODEL "prompt".
 """
 
 import json

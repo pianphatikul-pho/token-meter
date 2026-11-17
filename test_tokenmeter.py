@@ -1,4 +1,4 @@
-"""Tests for tokenmeter and planned_models. Standard library only:
+"""Tests for tokenmeter. Standard library only:
 
     python3 -m unittest
 """
@@ -16,7 +16,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 from unittest import mock
 
-import planned_models as plan
 import tokenmeter
 from tokenmeter import (
     BudgetExceeded, TokenMeter, Usage, detect, from_anthropic, from_claude_code, from_codex_jsonl,
@@ -429,9 +428,9 @@ class FakeServices(unittest.TestCase):
     # ---- the planned configurations, local path
 
     def test_planned_qwen3_request_uses_the_chapter_3_settings(self):
-        budget = plan.start_run(self.meter, "qwen3-30b-a3b", run="sqli-01/loop/seed-42", host=self.url)
+        budget = tokenmeter.start_run(self.meter, "qwen3-30b-a3b", run="sqli-01/loop/seed-42", host=self.url)
         self.assertEqual((budget.name, budget.limit), ("sqli-01/loop/seed-42/repair", 120_000))
-        reply = plan.ask(self.meter, "qwen3-30b-a3b", "fix it", system="you repair code", seed=42,
+        reply = tokenmeter.ask(self.meter, "qwen3-30b-a3b", "fix it", system="you repair code", seed=42,
                          budgets=[budget], host=self.url, task="SQLI-01", round=1, step="patch")
         self.assertEqual(reply.text, "hello")
         body = self.last_chat_body()
@@ -452,7 +451,7 @@ class FakeServices(unittest.TestCase):
     def test_planned_qwen_output_limit_shrinks_with_the_budget_and_14b_has_no_thinking(self):
         budget = self.meter.budget("r/repair", 500)
         self.meter.record("x", Usage(200, 100), budgets=[budget])
-        plan.ask(self.meter, "qwen2.5-coder-14b-instruct", "fix it", seed=43, budgets=[budget], host=self.url)
+        tokenmeter.ask(self.meter, "qwen2.5-coder-14b-instruct", "fix it", seed=43, budgets=[budget], host=self.url)
         body = self.last_chat_body()
         self.assertEqual(body["model"], "qwen2.5-coder:14b-instruct-q4_K_M")
         self.assertNotIn("think", body)
@@ -470,16 +469,16 @@ class PlannedCloudClients(unittest.TestCase):
         self.addCleanup(self.meter.close)
 
     def test_every_planned_configuration_is_present(self):
-        self.assertEqual(set(plan.MODELS), {
+        self.assertEqual(set(tokenmeter.MODELS), {
             "gpt-6-astra", "gpt-6-luna", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5",
             "qwen2.5-14b-instruct", "qwen2.5-coder-14b-instruct", "qwen3-30b-a3b"})
         with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
-            self.assertEqual(plan.main(["list"]), 0)
+            self.assertEqual(tokenmeter.main(["list"]), 0)
         self.assertIn("qwen3:30b-a3b-q4_K_M", out.getvalue())
 
     def test_claude_code_request(self):
         with mock.patch.object(tokenmeter, "run_cli", return_value=json.dumps(CLAUDE_CODE)) as run:
-            reply = plan.ask(self.meter, "claude-opus-5-5", "fix it", system="you repair code",
+            reply = tokenmeter.ask(self.meter, "claude-opus-5-5", "fix it", system="you repair code",
                              workdir="/work", allow_edits=True, task="SQLI-01", round=2)
         command, sent = run.call_args.args
         self.assertEqual(command[:2], ["claude", "-p"])
@@ -499,12 +498,12 @@ class PlannedCloudClients(unittest.TestCase):
         failed = {**CLAUDE_CODE, "is_error": True, "result": "usage limit reached"}
         with mock.patch.object(tokenmeter, "run_cli", return_value=json.dumps(failed)):
             with self.assertRaises(RuntimeError):
-                plan.ask(self.meter, "claude-haiku-5-5", "fix it")
+                tokenmeter.ask(self.meter, "claude-haiku-5-5", "fix it")
         self.assertEqual(self.meter.rows()[0]["total_tokens"], 300)
 
     def test_codex_request(self):
         with mock.patch.object(tokenmeter, "run_cli", return_value=CODEX) as run:
-            reply = plan.ask(self.meter, "gpt-6-astra", "fix it")
+            reply = tokenmeter.ask(self.meter, "gpt-6-astra", "fix it")
         command, sent = run.call_args.args
         self.assertEqual(command[:3], ["codex", "exec", "--json"])
         self.assertIn("model_reasoning_effort=xhigh", command)
@@ -516,11 +515,11 @@ class PlannedCloudClients(unittest.TestCase):
 
     def test_cloud_configuration_marks_what_cannot_be_set(self):
         with mock.patch.object(tokenmeter, "cli_version", return_value="9.9.9 (Claude Code)"):
-            record = plan.describe("claude-sonnet-5-5")
-            self.assertIsNone(plan.start_run(self.meter, "claude-sonnet-5-5", run="r1"))
+            record = tokenmeter.describe("claude-sonnet-5-5")
+            self.assertIsNone(tokenmeter.start_run(self.meter, "claude-sonnet-5-5", run="r1"))
         self.assertEqual((record["client_version"], record["reasoning_effort"]), ("9.9.9 (Claude Code)", "xhigh"))
         for control in ("temperature", "top_p", "top_k", "seed"):
-            self.assertEqual(record[control], plan.NOT_CONFIGURABLE)
+            self.assertEqual(record[control], tokenmeter.NOT_CONFIGURABLE)
         self.assertIn("recorded only", record["token_limit_enforcement"])
 
 
@@ -551,7 +550,7 @@ class StandInServer(unittest.TestCase):
 
     def check(self, key, host=None):
         with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
-            code = plan.main(["check", key, "--host", host or self.url, "--ledger", self.ledger])
+            code = tokenmeter.main(["check", key, "--host", host or self.url, "--ledger", self.ledger])
         return code, out.getvalue()
 
     def test_every_planned_qwen_configuration_passes_its_check(self):
@@ -582,6 +581,66 @@ class StandInServer(unittest.TestCase):
             (row,) = meter.rows()
         self.assertEqual((row["output_tokens"], row["stop_reason"]), (5, "length"))
         self.assertEqual(row["flags"], "output_truncated,output_at_limit")
+
+    def run_main(self, *args):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out, \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            code = tokenmeter.main(list(args))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_ask_command_counts_tokens_and_applies_the_run_budget(self):
+        common = ("--host", self.url, "--ledger", self.ledger, "--run", "r1", "--task", "SQLI-01", "--seed", "42")
+        code, out, err = self.run_main("ask", "qwen3-30b-a3b", "Fix the login query.", *common,
+                                       "--round", "1", "--step", "patch")
+        self.assertEqual(code, 0, err)
+        self.assertIn("[stand-in reply]", out)
+        self.assertIn("[tokenmeter] qwen3-30b-a3b: input", err)
+        self.assertIn("budget left 119,9", err)
+        code, _, _ = self.run_main("ask", "qwen3-30b-a3b", "Try again.", *common, "--round", "2", "--step", "patch")
+        self.assertEqual(code, 0)
+        with TokenMeter(self.ledger) as meter:
+            rows = meter.rows()
+            self.assertEqual([(r["run"], r["task"], r["round"], r["step"]) for r in rows],
+                             [("r1", "SQLI-01", 1, "patch"), ("r1", "SQLI-01", 2, "patch")])
+            self.assertEqual(len(meter.configs("qwen3-30b-a3b")), 1)  # the run is set up only once
+            self.assertEqual(meter.budget("r1/repair").used(), sum(r["total_tokens"] for r in rows))
+
+    def test_ask_command_stops_when_the_run_budget_is_spent(self):
+        common = ("qwen2.5-14b-instruct", "hello", "--host", self.url, "--ledger", self.ledger, "--run", "tiny")
+        with mock.patch.object(tokenmeter, "LOCAL_RUN_TOKEN_BUDGET", 10):
+            first = self.run_main("ask", *common)
+            second = self.run_main("ask", *common)
+        self.assertEqual(first[0], 0)
+        self.assertEqual(second[0], 2)
+        self.assertIn("Not sent: budget exhausted: tiny/repair", second[2])
+
+    def test_ask_command_reads_files_and_writes_the_reply_to_a_file(self):
+        folder = os.path.dirname(self.ledger)
+        prompt, system, reply = (os.path.join(folder, name) for name in ("p.txt", "s.txt", "reply.txt"))
+        with open(prompt, "w", encoding="utf-8") as handle:
+            handle.write("Reply with the single word: ready")
+        with open(system, "w", encoding="utf-8") as handle:
+            handle.write("You repair code.")
+        code, out, err = self.run_main("ask", "qwen2.5-coder-14b-instruct", "--prompt-file", prompt,
+                                       "--system-file", system, "--out", reply, "--host", self.url,
+                                       "--ledger", self.ledger)
+        self.assertEqual((code, out), (0, ""))
+        with open(reply, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "ready")
+        with TokenMeter(self.ledger) as meter:
+            (row,) = meter.rows()
+        self.assertEqual(row["prompt_chars"], len(json.dumps(["You repair code.", "Reply with the single word: ready"])))
+
+    def test_a_model_added_to_the_settings_works_in_every_command(self):
+        added = {"my-qwen": {"client": "ollama", "model": "qwen2.5:14b-instruct-q4_K_M", "think": None,
+                             "sampling": {"temperature": 0.0, "top_p": 1.0, "top_k": 1}}}
+        with mock.patch.dict(tokenmeter.MODELS, added):
+            code, listed, _ = self.run_main("list")
+            self.assertIn("my-qwen", listed)
+            code, printed = self.check("my-qwen")
+        self.assertEqual(code, 0, printed)
+        with TokenMeter(self.ledger) as meter:
+            self.assertEqual(json.loads(meter.rows()[0]["tags"])["config"], "my-qwen")
 
     def test_unreachable_server_gives_a_clear_error_and_exit_code(self):
         code, printed = self.check("qwen3-30b-a3b", host="http://127.0.0.1:9")

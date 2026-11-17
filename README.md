@@ -8,17 +8,17 @@ ledger you get totals per model, per round, or however you label your calls,
 and a CSV for your own analysis. It can also hold a token budget and refuse
 calls once the budget is spent.
 
-The meter is one file, [tokenmeter.py](tokenmeter.py), with nothing to install
-beyond Python 3.9 or newer. It runs on Windows, macOS and Linux.
-[planned_models.py](planned_models.py) adds the eight model-and-agent
-configurations from Chapter 3 of the project on top of it.
+Everything is in one file, [tokenmeter.py](tokenmeter.py), with nothing to
+install beyond Python 3.9 or newer. It runs on Windows, macOS and Linux. The
+file holds the meter, the eight model-and-agent configurations from Chapter 3
+of the project, and the terminal commands, so it is the only file you need to
+copy or run.
 
 ## What is in this repository
 
 | File | What it is |
 | --- | --- |
-| [tokenmeter.py](tokenmeter.py) | the meter itself; copy this one file into any project |
-| [planned_models.py](planned_models.py) | the planned GPT, Claude and Qwen configurations, with their settings and limits |
+| [tokenmeter.py](tokenmeter.py) | **the whole program**: the meter, the planned GPT, Claude and Qwen models with their settings, and the terminal commands. Copy this one file into any project. |
 | [test_tokenmeter.py](test_tokenmeter.py) | the automated tests |
 | [examples/quickstart.py](examples/quickstart.py) | a tour of every feature, using a pretend model |
 | [examples/local_test_server.py](examples/local_test_server.py) | a stand-in model server, for testing without a GPU or API key |
@@ -47,7 +47,7 @@ ticked, or type `py` instead of `python`.
 **2. Install Git**, from git-scm.com on Windows. macOS offers to install it the
 first time you type `git`.
 
-**3. Download the code.** This repository is private, so sign in to GitHub
+**3. Download the code.** If the repository is private, sign in to GitHub
 when asked:
 
 ```bash
@@ -101,15 +101,15 @@ python examples/local_test_server.py
 ledger.
 
 ```bash
-python planned_models.py check qwen2.5-14b-instruct --host http://127.0.0.1:11435 --ledger test_ledger.db
+python tokenmeter.py check qwen2.5-14b-instruct --host http://127.0.0.1:11435 --ledger test_ledger.db
 ```
 
 ```bash
-python planned_models.py check qwen2.5-coder-14b-instruct --host http://127.0.0.1:11435 --ledger test_ledger.db
+python tokenmeter.py check qwen2.5-coder-14b-instruct --host http://127.0.0.1:11435 --ledger test_ledger.db
 ```
 
 ```bash
-python planned_models.py check qwen3-30b-a3b --host http://127.0.0.1:11435 --ledger test_ledger.db
+python tokenmeter.py check qwen3-30b-a3b --host http://127.0.0.1:11435 --ledger test_ledger.db
 ```
 
 Each one should print `reply: ready`, `usage_source reported` and empty
@@ -146,7 +146,7 @@ ollama pull qwen3:30b-a3b-q4_K_M
 Then check each one, for example:
 
 ```bash
-python planned_models.py check qwen3-30b-a3b
+python tokenmeter.py check qwen3-30b-a3b
 ```
 
 **Claude, through Claude Code.** Install Claude Code, sign in, and update it
@@ -155,13 +155,13 @@ setting). Run the check from a normal terminal, not from inside a Claude Code
 session: Claude Code will not start inside another Claude Code session.
 
 ```bash
-python planned_models.py check claude-haiku-5-5
+python tokenmeter.py check claude-haiku-5-5
 ```
 
 **GPT, through Codex.** Install the Codex command-line tool and sign in, then:
 
 ```bash
-python planned_models.py check gpt-6-astra
+python tokenmeter.py check gpt-6-astra
 ```
 
 The Codex path has never been run against the real tool. Read its check
@@ -172,14 +172,35 @@ Each check should end with `usage_source reported` and no flags. If it says
 must not be used. To see every planned configuration:
 
 ```bash
-python planned_models.py list
+python tokenmeter.py list
 ```
 
 ### Step 4. Use it in your experiment
 
+**From the terminal.** `ask` sends a prompt to a planned model, prints the
+reply, and records the tokens. The labels say which run, vulnerability, round
+and step the call belongs to.
+
+```bash
+python tokenmeter.py ask qwen3-30b-a3b "Explain this vulnerability." --run sqli-01/loop/seed-42 --task SQLI-01 --round 1 --step patch --seed 42
+```
+
+For a long prompt, put it in a text file. `--out` saves the reply to a file:
+
+```bash
+python tokenmeter.py ask claude-opus-5-5 --prompt-file prompt.txt --out reply.txt --run sqli-01/loop/rep-1 --task SQLI-01 --round 1
+```
+
+After the reply, one line shows the tokens used, the budget left and any
+flags. With `--run`, a local model is held to the run's 120,000-token budget:
+once it is spent, `ask` refuses to send and exits with code 2. Run
+`python tokenmeter.py ask --help` for every option, including `--system-file`,
+`--workdir` and `--allow-edits` for the coding agents.
+
+**From your own Python code:**
+
 ```python
-from tokenmeter import TokenMeter
-from planned_models import ask, start_run
+from tokenmeter import TokenMeter, ask, start_run
 
 meter = TokenMeter("token_ledger.db")
 run = "sqli-01/loop/seed-42"
@@ -219,6 +240,25 @@ and `stop_reason`. Add `--where model=qwen3:30b-a3b-q4_K_M round=2` to filter.
 `export` writes one CSV row per call, `budgets` shows what each budget has used,
 and `configs` prints the saved configuration records.
 
+## Changing things
+
+`tokenmeter.py` starts with a guide that says where each kind of change goes,
+and the file is split into numbered sections, each with a note on what it does.
+
+| To change | Go to |
+| --- | --- |
+| a planned model: add, remove, rename, or change its settings | section 1, `MODELS` |
+| the limits, the token budget or the seeds | section 1, `LOCAL_LIMITS`, `LOCAL_RUN_TOKEN_BUDGET`, `LOCAL_SEEDS` |
+| the default Ollama address | section 1, `OLLAMA_HOST` |
+| support a provider whose replies look different | section 4: write one extractor function |
+| support a new kind of client (not Ollama, Claude Code or Codex) | section 8, `ask()` and `describe()` |
+| store an extra column for every call | section 2 and `TokenMeter.record()` in section 6 |
+| add a terminal command | section 9 |
+
+To add a model, copy an entry of the same client in `MODELS` and change its
+short name and `"model"`. It then works in every command (`list`, `check`,
+`ask`, `describe`). After any change, run `python -m unittest` again.
+
 ## The planned models
 
 | Configuration | Reached through | Exact model | Settings applied |
@@ -234,6 +274,7 @@ the 8,192-token output limit per request, the seed you pass (42, 43, 44) and
 the 120,000-token budget per run. Each request records how much of the model
 is on the GPU.
 
+Their settings are in section 1 of [tokenmeter.py](tokenmeter.py).
 `start_run` saves a configuration record: exact model id, model-file hash,
 quantization, Ollama or client version, and every setting. For Codex and
 Claude Code, the controls they do not expose (temperature, top-p, top-k, seed)

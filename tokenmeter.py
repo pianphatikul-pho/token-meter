@@ -1,6 +1,7 @@
 """tokenmeter: count the tokens that any AI model call uses.
 
-One file, standard library only (Python 3.9+). Copy it next to your code.
+One file, standard library only (Python 3.9+, Windows / macOS / Linux). Copy
+it next to your code.
 
     from tokenmeter import TokenMeter
 
@@ -10,7 +11,8 @@ One file, standard library only (Python 3.9+). Copy it next to your code.
 
 The meter sits between your code and the model. It runs the call, reads the
 token counts out of the model's reply, and saves one row per call in a small
-SQLite file (the ledger). Reports and a CSV export come from that file.
+SQLite file (the ledger). It can also hold a token budget and refuse calls
+once the budget is spent.
 
 How counts are normalized, so every provider means the same thing:
 
@@ -18,14 +20,28 @@ How counts are normalized, so every provider means the same thing:
       cache_read_tokens    part of the input that was served from a cache
       cache_write_tokens   part of the input that was written to a cache
     output_tokens      everything generated, reasoning / thinking included
-      reasoning_tokens     part of the output that was reasoning, if reported
+      reasoning_tokens     part of the output that was reasoning
     total_tokens       input_tokens + output_tokens
+
+A breakdown column is EMPTY (not 0) when the provider does not report it, so
+"unavailable" is never mistaken for "zero".
 
 `usage_source` on each row says where the numbers came from:
 
     reported    the provider returned them
     estimated   the provider returned none, so characters / 4 was used
-    none        the call failed before any usage came back
+    none        the call failed or was refused before any usage came back
+
+`flags` on each row lists anything that needs a second look:
+
+    model_mismatch     a different model answered than the one you asked for
+    multiple_models    an agent tool used more than one model in this call
+    output_truncated   the reply was cut off at the output limit
+    input_over_limit   more input tokens than your per-request limit
+    output_at_limit    output reached your per-request limit
+    context_full       input + output filled the context window
+    budget_refused     the call was not made: a budget was already spent
+    over_budget        this call pushed a budget past its limit
 """
 
 from __future__ import annotations
@@ -33,7 +49,9 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -44,61 +62,97 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterator, Optional, Sequence
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 CHARS_PER_TOKEN_ESTIMATE = 4
+UNAVAILABLE = "unavailable"
 
 # Labels you can attach to a call and group reports by.
 CONTEXT_COLUMNS = ("experiment", "run", "task", "round", "step")
-GROUP_COLUMNS = ("model", "provider") + CONTEXT_COLUMNS + ("usage_source",)
+GROUP_COLUMNS = ("model", "provider", "reported_model") + CONTEXT_COLUMNS + ("usage_source", "stop_reason")
+ALWAYS_KNOWN = ("input_tokens", "output_tokens", "total_tokens", "seconds", "prompt_chars", "response_chars")
+MAY_BE_UNAVAILABLE = ("cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "reasoning_chars", "cost_usd")
 SUM_COLUMNS = (
     "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens",
-    "total_tokens", "cost_usd", "seconds", "prompt_chars", "response_chars",
+    "total_tokens", "cost_usd", "seconds", "prompt_chars", "response_chars", "reasoning_chars",
 )
 CSV_COLUMNS = (
-    ("call_id", "time_utc", "model", "provider") + CONTEXT_COLUMNS + SUM_COLUMNS
-    + ("usage_source", "error", "tags")
+    ("call_id", "time_utc", "model", "reported_model", "provider") + CONTEXT_COLUMNS + SUM_COLUMNS
+    + ("usage_source", "stop_reason", "flags", "error", "tags")
 )
+TRUNCATED_STOP_REASONS = {"length", "max_tokens", "max_output_tokens", "model_context_window_exceeded"}
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS calls (
+_CALLS_TABLE = """
+CREATE TABLE calls (
     call_id INTEGER PRIMARY KEY AUTOINCREMENT,
     time_utc TEXT NOT NULL,
     model TEXT NOT NULL,
+    reported_model TEXT,
     provider TEXT NOT NULL DEFAULT '',
     experiment TEXT, run TEXT, task TEXT, round INTEGER, step TEXT,
     input_tokens INTEGER NOT NULL DEFAULT 0,
-    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER,
+    cache_write_tokens INTEGER,
     output_tokens INTEGER NOT NULL DEFAULT 0,
-    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+    reasoning_tokens INTEGER,
     total_tokens INTEGER NOT NULL DEFAULT 0,
     cost_usd REAL,
     seconds REAL NOT NULL DEFAULT 0,
     prompt_chars INTEGER NOT NULL DEFAULT 0,
     response_chars INTEGER NOT NULL DEFAULT 0,
+    reasoning_chars INTEGER,
     usage_source TEXT NOT NULL DEFAULT 'reported',
+    stop_reason TEXT,
+    flags TEXT NOT NULL DEFAULT '',
     error TEXT,
     tags TEXT NOT NULL DEFAULT '{}',
     raw_usage TEXT NOT NULL DEFAULT '{}'
 )
 """
+_CALL_COLUMNS = (
+    "call_id", "time_utc", "model", "reported_model", "provider", "experiment", "run", "task", "round", "step",
+    "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens",
+    "total_tokens", "cost_usd", "seconds", "prompt_chars", "response_chars", "reasoning_chars",
+    "usage_source", "stop_reason", "flags", "error", "tags", "raw_usage",
+)
+_OTHER_TABLES = """
+CREATE TABLE IF NOT EXISTS budgets (
+    name TEXT PRIMARY KEY, limit_tokens INTEGER NOT NULL, created_utc TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS budget_charges (
+    budget TEXT NOT NULL, call_id INTEGER NOT NULL, tokens INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS configs (
+    config_id INTEGER PRIMARY KEY AUTOINCREMENT, time_utc TEXT NOT NULL, name TEXT NOT NULL, config TEXT NOT NULL
+);
+"""
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 # --------------------------------------------------------------------- usage
 
 @dataclass
 class Usage:
-    """Token counts for one call, already normalized (see the module docstring)."""
+    """Token counts for one call, already normalized (see the module docstring).
+
+    Leave a breakdown field as None when the provider does not report it.
+    """
 
     input_tokens: int = 0
     output_tokens: int = 0
-    cache_read_tokens: int = 0
-    cache_write_tokens: int = 0
-    reasoning_tokens: int = 0
+    cache_read_tokens: Optional[int] = None
+    cache_write_tokens: Optional[int] = None
+    reasoning_tokens: Optional[int] = None
     cost_usd: Optional[float] = None  # only when the provider reports a cost
     source: str = "reported"
+    model: Optional[str] = None  # the model the provider says actually answered
+    stop_reason: Optional[str] = None  # why generation ended, in the provider's words
+    reasoning_chars: Optional[int] = None  # size of visible thinking text, if any
     raw: dict = field(default_factory=dict)  # the provider's own numbers, kept for auditing
+    tags: dict = field(default_factory=dict)  # extra facts to store with the call
 
     @property
     def total_tokens(self) -> int:
@@ -130,6 +184,15 @@ def _int(value: Any) -> int:
         return 0
 
 
+def _maybe(container: dict, key: str) -> Optional[int]:
+    """The count if the provider sent it, otherwise None (unavailable)."""
+    return _int(container[key]) if container.get(key) is not None else None
+
+
+def _text(value: Any) -> Optional[str]:
+    return str(value) if value not in (None, "") else None
+
+
 # ----------------------------------------------------- provider extractors
 #
 # An extractor takes whatever the model call returned and gives back a Usage,
@@ -142,26 +205,34 @@ def from_openai(response: Any) -> Optional[Usage]:
     Their input count already includes cached tokens and their output count
     already includes reasoning tokens.
     """
-    usage = _as_dict(_as_dict(response).get("usage"))
+    data = _as_dict(response)
+    usage = _as_dict(data.get("usage"))
     if not usage:
         return None
     if "prompt_tokens" in usage or "completion_tokens" in usage:  # Chat Completions
         details_in = _as_dict(usage.get("prompt_tokens_details"))
         details_out = _as_dict(usage.get("completion_tokens_details"))
+        choices = data.get("choices") or [{}]
+        stop = _as_dict(choices[0]).get("finish_reason")
         return Usage(
             input_tokens=_int(usage.get("prompt_tokens")),
             output_tokens=_int(usage.get("completion_tokens")),
-            cache_read_tokens=_int(details_in.get("cached_tokens")),
-            reasoning_tokens=_int(details_out.get("reasoning_tokens")),
+            cache_read_tokens=_maybe(details_in, "cached_tokens"),
+            reasoning_tokens=_maybe(details_out, "reasoning_tokens"),
+            model=_text(data.get("model")),
+            stop_reason=_text(stop),
             raw=usage,
         )
     details_in = _as_dict(usage.get("input_tokens_details"))  # Responses API
     details_out = _as_dict(usage.get("output_tokens_details"))
+    incomplete = _as_dict(data.get("incomplete_details")).get("reason")
     return Usage(
         input_tokens=_int(usage.get("input_tokens")),
         output_tokens=_int(usage.get("output_tokens")),
-        cache_read_tokens=_int(details_in.get("cached_tokens")),
-        reasoning_tokens=_int(details_out.get("reasoning_tokens")),
+        cache_read_tokens=_maybe(details_in, "cached_tokens"),
+        reasoning_tokens=_maybe(details_out, "reasoning_tokens"),
+        model=_text(data.get("model")),
+        stop_reason=_text(incomplete or data.get("status")),
         raw=usage,
     )
 
@@ -170,32 +241,46 @@ def from_anthropic(response: Any) -> Optional[Usage]:
     """Claude through the Anthropic Messages API.
 
     Anthropic reports uncached input separately from cache reads and cache
-    writes, so the three are added to get the full input.
+    writes, so the three are added to get the full input. Thinking tokens are
+    inside output_tokens and are not reported separately.
     """
-    usage = _as_dict(_as_dict(response).get("usage"))
+    data = _as_dict(response)
+    usage = _as_dict(data.get("usage"))
     if not usage:
         return None
-    cache_read = _int(usage.get("cache_read_input_tokens"))
-    cache_write = _int(usage.get("cache_creation_input_tokens"))
+    cache_read, cache_write = _maybe(usage, "cache_read_input_tokens"), _maybe(usage, "cache_creation_input_tokens")
     return Usage(
-        input_tokens=_int(usage.get("input_tokens")) + cache_read + cache_write,
+        input_tokens=_int(usage.get("input_tokens")) + (cache_read or 0) + (cache_write or 0),
         output_tokens=_int(usage.get("output_tokens")),
         cache_read_tokens=cache_read,
         cache_write_tokens=cache_write,
+        model=_text(data.get("model")),
+        stop_reason=_text(data.get("stop_reason")),
         raw=usage,
     )
 
 
 def from_ollama(response: Any) -> Optional[Usage]:
-    """Local models through Ollama's own API (/api/chat or /api/generate)."""
+    """Local models through Ollama's own API (/api/chat or /api/generate).
+
+    For a thinking model (Qwen3), eval_count covers thinking and answer
+    together. Ollama gives no separate thinking-token count, so
+    reasoning_tokens stays empty and the size of the thinking text is kept in
+    reasoning_chars instead.
+    """
     data = _as_dict(response)
     if "prompt_eval_count" not in data and "eval_count" not in data:
         return None
+    message = _as_dict(data.get("message"))
+    thinking = message.get("thinking") if message else data.get("thinking")
     return Usage(
         input_tokens=_int(data.get("prompt_eval_count")),
         output_tokens=_int(data.get("eval_count")),
         cost_usd=0.0,  # local: no API bill
-        raw={k: v for k, v in data.items() if k.endswith(("_count", "_duration"))},
+        model=_text(data.get("model")),
+        stop_reason=_text(data.get("done_reason")),
+        reasoning_chars=len(thinking) if isinstance(thinking, str) else None,
+        raw={k: v for k, v in data.items() if k.endswith(("_count", "_duration")) or k == "done_reason"},
     )
 
 
@@ -206,29 +291,35 @@ def from_gemini(response: Any) -> Optional[Usage]:
     if not usage:
         return None
 
-    def pick(camel: str, snake: str) -> int:
-        return _int(usage.get(camel, usage.get(snake)))
+    def pick(camel: str, snake: str) -> Optional[int]:
+        value = usage.get(camel, usage.get(snake))
+        return _int(value) if value is not None else None
 
-    prompt = pick("promptTokenCount", "prompt_token_count")
-    candidates = pick("candidatesTokenCount", "candidates_token_count")
+    prompt = pick("promptTokenCount", "prompt_token_count") or 0
+    candidates = pick("candidatesTokenCount", "candidates_token_count") or 0
     thoughts = pick("thoughtsTokenCount", "thoughts_token_count")
     total = pick("totalTokenCount", "total_token_count")
     # Use the provider's own total to decide whether thoughts are already
     # inside the candidates count.
-    output = candidates if total and prompt + candidates == total else candidates + thoughts
+    output = candidates if total and prompt + candidates == total else candidates + (thoughts or 0)
+    first = _as_dict((data.get("candidates") or [{}])[0])
     return Usage(
         input_tokens=prompt,
         output_tokens=output,
         cache_read_tokens=pick("cachedContentTokenCount", "cached_content_token_count"),
         reasoning_tokens=thoughts,
+        model=_text(data.get("modelVersion") or data.get("model_version")),
+        stop_reason=_text(first.get("finishReason") or first.get("finish_reason")),
         raw=usage,
     )
 
 
 def from_claude_code(response: Any) -> Optional[Usage]:
-    """The JSON printed by `claude -p ... --output-format json` (dict or text).
+    """The JSON printed by `claude -p --output-format json` (dict or text).
 
     One call here can be several model turns; the counts are for all of them.
+    `reported_model` lists every model the tool says it used, so a downgrade
+    or a helper model shows up.
     """
     data = json.loads(response) if isinstance(response, str) else _as_dict(response)
     usage = from_anthropic(data)
@@ -236,6 +327,11 @@ def from_claude_code(response: Any) -> Optional[Usage]:
         return None
     if data.get("total_cost_usd") is not None:
         usage.cost_usd = float(data["total_cost_usd"])
+    per_model = _as_dict(data.get("modelUsage"))
+    usage.model = ", ".join(sorted(per_model)) if per_model else _text(data.get("model"))
+    usage.stop_reason = _text(data.get("subtype"))
+    if data.get("num_turns") is not None:
+        usage.tags["turns"] = data["num_turns"]
     usage.raw = {k: v for k, v in data.items() if k != "result"}
     return usage
 
@@ -248,23 +344,46 @@ def from_codex_jsonl(output: Any) -> Optional[Usage]:
     """
     if not isinstance(output, str):
         return None
-    turns = []
+    turns, model = [], None
     for line in output.splitlines():
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(event, dict) and event.get("type") == "turn.completed" and event.get("usage"):
+        if not isinstance(event, dict):
+            continue
+        model = model or _text(event.get("model"))
+        if event.get("type") == "turn.completed" and event.get("usage"):
             turns.append(event["usage"])
     if not turns:
         return None
+
+    def total(key: str) -> Optional[int]:
+        return sum(_int(t.get(key)) for t in turns) if any(t.get(key) is not None for t in turns) else None
+
     return Usage(
-        input_tokens=sum(_int(t.get("input_tokens")) for t in turns),
-        output_tokens=sum(_int(t.get("output_tokens")) for t in turns),
-        cache_read_tokens=sum(_int(t.get("cached_input_tokens")) for t in turns),
-        reasoning_tokens=sum(_int(t.get("reasoning_output_tokens")) for t in turns),
+        input_tokens=total("input_tokens") or 0,
+        output_tokens=total("output_tokens") or 0,
+        cache_read_tokens=total("cached_input_tokens"),
+        reasoning_tokens=total("reasoning_output_tokens"),
+        model=model,
         raw={"turns": turns},
+        tags={"turns": len(turns)},
     )
+
+
+def codex_final_message(output: str) -> str:
+    """The last message the Codex agent wrote, from `codex exec --json` output."""
+    text = ""
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = event.get("item") if isinstance(event, dict) else None
+        if isinstance(item, dict) and item.get("type") == "agent_message" and item.get("text"):
+            text = item["text"]
+    return text
 
 
 def detect(response: Any) -> Optional[Usage]:
@@ -303,7 +422,7 @@ def detect(response: Any) -> Optional[Usage]:
 def guess_text(response: Any) -> str:
     """Best effort: the text the model wrote, for the response size in characters."""
     if isinstance(response, str):
-        return response
+        return codex_final_message(response) or response
     data = _as_dict(response)
     if not data:
         return ""
@@ -336,6 +455,64 @@ def _chars(value: Any) -> int:
         return len(str(value))
 
 
+def same_model(requested: str, reported: str) -> bool:
+    """True if any reported model is the requested one (allowing date suffixes)."""
+    wanted = requested.strip().lower()
+    for name in reported.lower().split(","):
+        name = name.strip()
+        if name and (wanted in name or name in wanted):
+            return True
+    return False
+
+
+# ------------------------------------------------------------------- budgets
+
+class BudgetExceeded(RuntimeError):
+    """Raised instead of making a call when a budget has nothing left."""
+
+    def __init__(self, budget: "Budget"):
+        self.budget = budget
+        super().__init__(f"budget exhausted: {budget.name} (used {budget.used():,} of {budget.limit:,} tokens)")
+
+
+class Budget:
+    """A token allowance stored in the ledger. Get one from `meter.budget()`.
+
+    The meter checks it BEFORE each call and refuses the call when nothing is
+    left. It cannot stop a call that is already running, so one call can still
+    overshoot: cap the output yourself with `max_output()`. For agent tools
+    that make many model turns inside one call, treat this as a stop rule
+    between calls, not an exact limit.
+    """
+
+    def __init__(self, meter: "TokenMeter", name: str, limit: int):
+        self.meter, self.name, self.limit = meter, name, int(limit)
+
+    def used(self) -> int:
+        return self.meter._scalar("SELECT COALESCE(SUM(tokens), 0) FROM budget_charges WHERE budget = ?", [self.name])
+
+    def remaining(self) -> int:
+        return max(0, self.limit - self.used())
+
+    @property
+    def exhausted(self) -> bool:
+        return self.remaining() <= 0
+
+    def max_output(self, cap: Optional[int] = None) -> int:
+        """How many output tokens the next request may be allowed."""
+        left = self.remaining()
+        return left if cap is None else min(int(cap), left)
+
+    def __repr__(self) -> str:
+        return f"Budget({self.name!r}, used {self.used():,} of {self.limit:,})"
+
+
+def output_allowance(budgets: Sequence[Budget], cap: int) -> int:
+    """The output-token limit to send with the next request: your per-request
+    cap, or less if any budget has less than that left."""
+    return min([int(cap)] + [b.remaining() for b in budgets])
+
+
 # --------------------------------------------------------------------- meter
 
 class TokenMeter:
@@ -353,12 +530,31 @@ class TokenMeter:
         self.path = str(path)
         self.prices = dict(prices or {})
         self._context = dict(context)
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._db = sqlite3.connect(self.path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         with self._lock:
-            self._db.execute(_SCHEMA)
-            self._db.commit()
+            self._prepare()
+
+    def _prepare(self) -> None:
+        """Create the tables, upgrading a ledger made by an older version."""
+        existing = {row["name"]: row for row in self._db.execute("PRAGMA table_info(calls)")}
+        if not existing:
+            self._db.execute(_CALLS_TABLE)
+        elif any(c not in existing for c in _CALL_COLUMNS) or any(
+            existing[c]["notnull"] for c in MAY_BE_UNAVAILABLE if c in existing
+        ):
+            shared = ", ".join(c for c in _CALL_COLUMNS if c in existing)
+            self._db.execute("ALTER TABLE calls RENAME TO calls_old")
+            self._db.execute(_CALLS_TABLE)
+            self._db.execute(f"INSERT INTO calls ({shared}) SELECT {shared} FROM calls_old")
+            self._db.execute("DROP TABLE calls_old")
+        self._db.executescript(_OTHER_TABLES)
+        self._db.commit()
+
+    def _scalar(self, sql: str, values: Sequence[Any] = ()) -> Any:
+        with self._lock:
+            return self._db.execute(sql, list(values)).fetchone()[0]
 
     # ---- labelling
 
@@ -376,6 +572,37 @@ class TokenMeter:
         finally:
             self._context = previous
 
+    # ---- budgets
+
+    def budget(self, name: str, limit: Optional[int] = None) -> Budget:
+        """Create a token budget, or reopen one that is already in the ledger.
+
+            total = meter.budget("run-7/total", 120_000)
+
+        A budget's limit is fixed once created: reopening it with a different
+        limit is an error, so a run cannot quietly get more tokens.
+        """
+        with self._lock:
+            row = self._db.execute("SELECT limit_tokens FROM budgets WHERE name = ?", [name]).fetchone()
+            if row is None:
+                if limit is None:
+                    raise ValueError(f"no budget named {name!r} in this ledger; give a limit to create it")
+                self._db.execute("INSERT INTO budgets VALUES (?, ?, ?)", [name, int(limit), _now()])
+                self._db.commit()
+                return Budget(self, name, int(limit))
+            if limit is not None and int(limit) != row["limit_tokens"]:
+                raise ValueError(f"budget {name!r} already exists with limit {row['limit_tokens']:,}")
+            return Budget(self, name, row["limit_tokens"])
+
+    def budgets(self) -> list[dict]:
+        """Every budget in the ledger with what it has used."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT b.name, b.limit_tokens, COALESCE(SUM(c.tokens), 0) AS used_tokens, COUNT(c.call_id) AS calls "
+                "FROM budgets b LEFT JOIN budget_charges c ON c.budget = b.name GROUP BY b.name ORDER BY b.name"
+            ).fetchall()
+        return [{**dict(r), "remaining_tokens": max(0, r["limit_tokens"] - r["used_tokens"])} for r in rows]
+
     # ---- recording
 
     def record(
@@ -388,12 +615,19 @@ class TokenMeter:
         seconds: float = 0.0,
         error: Optional[str] = None,
         provider: str = "",
+        budgets: Sequence[Budget] = (),
+        limits: Optional[dict] = None,
+        flags: Sequence[str] = (),
         **labels: Any,
     ) -> dict:
         """Write one call to the ledger and return the stored row.
 
         Use this directly when you already have the numbers (for example after
         a streamed reply finishes). Otherwise use `measure`.
+
+        budgets  budgets to charge this call's total tokens to
+        limits   optional per-request limits to check the call against:
+                 {"max_input_tokens": .., "max_output_tokens": .., "context_window": ..}
         """
         prompt_chars, response_chars = _chars(prompt), _chars(response)
         if usage is None:
@@ -410,11 +644,28 @@ class TokenMeter:
             price_in, price_out = self.prices[model]
             cost = (usage.input_tokens * price_in + usage.output_tokens * price_out) / 1_000_000
 
-        merged = {**self._context, **labels}
+        found = list(flags)
+        if usage.model:
+            if not same_model(model, usage.model):
+                found.append("model_mismatch")
+            elif "," in usage.model:
+                found.append("multiple_models")
+        if (usage.stop_reason or "").lower() in TRUNCATED_STOP_REASONS:
+            found.append("output_truncated")
+        limits = limits or {}
+        if limits.get("max_input_tokens") and usage.input_tokens > limits["max_input_tokens"]:
+            found.append("input_over_limit")
+        if limits.get("max_output_tokens") and usage.output_tokens >= limits["max_output_tokens"]:
+            found.append("output_at_limit")
+        if limits.get("context_window") and usage.total_tokens >= limits["context_window"]:
+            found.append("context_full")
+
+        merged = {**self._context, **labels, **usage.tags}
         core = {name: merged.pop(name, None) for name in CONTEXT_COLUMNS}
         row = {
-            "time_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "time_utc": _now(),
             "model": model,
+            "reported_model": usage.model,
             "provider": provider,
             **core,
             "input_tokens": usage.input_tokens,
@@ -427,7 +678,10 @@ class TokenMeter:
             "seconds": round(seconds, 4),
             "prompt_chars": prompt_chars,
             "response_chars": response_chars,
+            "reasoning_chars": usage.reasoning_chars,
             "usage_source": usage.source,
+            "stop_reason": usage.stop_reason,
+            "flags": "",
             "error": error,
             "tags": json.dumps(merged, default=str, sort_keys=True),
             "raw_usage": json.dumps(usage.raw, default=str),
@@ -438,8 +692,15 @@ class TokenMeter:
                 f"INSERT INTO calls ({', '.join(names)}) VALUES ({', '.join('?' for _ in names)})",
                 [row[n] for n in names],
             )
+            row["call_id"] = cursor.lastrowid
+            for budget in budgets:
+                self._db.execute("INSERT INTO budget_charges VALUES (?, ?, ?)",
+                                 [budget.name, row["call_id"], usage.total_tokens])
+            if any(b.used() > b.limit for b in budgets):
+                found.append("over_budget")
+            row["flags"] = ",".join(dict.fromkeys(found))
+            self._db.execute("UPDATE calls SET flags = ? WHERE call_id = ?", [row["flags"], row["call_id"]])
             self._db.commit()
-        row["call_id"] = cursor.lastrowid
         return row
 
     def measure(
@@ -451,6 +712,8 @@ class TokenMeter:
         prompt: Any = "",
         text: Optional[Callable[[Any], str]] = None,
         provider: str = "",
+        budgets: Sequence[Budget] = (),
+        limits: Optional[dict] = None,
         **labels: Any,
     ) -> Any:
         """Run `call()`, record what it used, and return its result unchanged.
@@ -463,10 +726,20 @@ class TokenMeter:
         prompt   what you sent (text or messages), for the size in characters
                  and for the estimate when no counts come back
         text     optional function returning the reply text from the result
+        budgets  budgets to check before the call and charge after it. If any
+                 is already spent, the call is NOT made: the refusal is
+                 recorded and BudgetExceeded is raised.
+        limits   per-request limits to flag (see `record`)
 
         If the call raises, the failure is recorded and the error is raised
         again, so your own error handling still works.
         """
+        for budget in budgets:
+            if budget.exhausted:
+                error = BudgetExceeded(budget)
+                self.record(model, None, prompt=prompt, error=str(error), provider=provider,
+                            flags=["budget_refused"], **labels)
+                raise error
         started = time.perf_counter()
         try:
             result = call()
@@ -477,7 +750,7 @@ class TokenMeter:
         seconds = time.perf_counter() - started
         reply = text(result) if text is not None else guess_text(result)
         self.record(model, extract(result), prompt=prompt, response=reply, seconds=seconds,
-                    provider=provider, **labels)
+                    provider=provider, budgets=budgets, limits=limits, **labels)
         return result
 
     def wrap(self, function: Callable[..., Any], model: str, **options: Any) -> Callable[..., Any]:
@@ -496,6 +769,23 @@ class TokenMeter:
         metered.__name__ = getattr(function, "__name__", "metered")
         metered.__doc__ = function.__doc__
         return metered
+
+    # ---- configuration records
+
+    def save_config(self, name: str, config: dict) -> int:
+        """Store a snapshot of how a model was set up (versions, hashes,
+        settings), so every run shows exactly what produced it."""
+        with self._lock:
+            cursor = self._db.execute("INSERT INTO configs (time_utc, name, config) VALUES (?, ?, ?)",
+                                      [_now(), name, json.dumps(config, default=str, sort_keys=True)])
+            self._db.commit()
+        return cursor.lastrowid
+
+    def configs(self, name: Optional[str] = None) -> list[dict]:
+        where, values = (" WHERE name = ?", [name]) if name else ("", [])
+        with self._lock:
+            rows = self._db.execute(f"SELECT * FROM configs{where} ORDER BY config_id", values).fetchall()
+        return [{**dict(r), "config": json.loads(r["config"])} for r in rows]
 
     # ---- reading
 
@@ -517,21 +807,23 @@ class TokenMeter:
         return [dict(r) for r in found]
 
     def summary(self, by: Sequence[str] = ("model",), **filters: Any) -> list[dict]:
-        """Totals grouped by any of: model, provider, experiment, run, task, round, step."""
+        """Totals grouped by any of: model, provider, reported_model,
+        experiment, run, task, round, step. A total is None when no call in
+        the group reported that number."""
         by = [by] if isinstance(by, str) else list(by)
         for name in by:
             if name not in GROUP_COLUMNS:
                 raise ValueError(f"cannot group by {name!r}; use any of {GROUP_COLUMNS}")
         where, values = self._where(filters)
         keys = ", ".join(by)
-        # cost stays empty (not 0) when no call in the group has a known cost
         sums = ", ".join(
-            f"SUM({c}) AS {c}" if c == "cost_usd" else f"COALESCE(SUM({c}), 0) AS {c}" for c in SUM_COLUMNS
+            f"COALESCE(SUM({c}), 0) AS {c}" if c in ALWAYS_KNOWN else f"SUM({c}) AS {c}" for c in SUM_COLUMNS
         )
         sql = (
             f"SELECT {keys + ', ' if by else ''}COUNT(*) AS calls, "
             "SUM(error IS NOT NULL) AS failed_calls, "
             "SUM(usage_source = 'estimated') AS estimated_calls, "
+            "SUM(flags != '') AS flagged_calls, "
             f"{sums} FROM calls{where}"
             + (f" GROUP BY {keys} ORDER BY {keys}" if by else "")
         )
@@ -540,13 +832,13 @@ class TokenMeter:
         return [dict(r) for r in found]
 
     def report(self, by: Sequence[str] = ("model",), **filters: Any) -> str:
-        """The summary as a text table."""
+        """The summary as a text table. "-" means the number is unavailable."""
         by = [by] if isinstance(by, str) else list(by)
         rows = self.summary(by, **filters)
         if not rows:
             return "No calls recorded."
-        columns = by + ["calls", "failed_calls", "input_tokens", "cache_read_tokens", "output_tokens",
-                        "reasoning_tokens", "total_tokens", "cost_usd", "seconds"]
+        columns = by + ["calls", "failed_calls", "flagged_calls", "input_tokens", "cache_read_tokens",
+                        "output_tokens", "reasoning_tokens", "total_tokens", "cost_usd", "seconds"]
 
         def cell(name: str, value: Any) -> str:
             if value is None:
@@ -565,13 +857,17 @@ class TokenMeter:
         estimated = sum(row["estimated_calls"] or 0 for row in rows)
         if estimated:
             lines.append(f"\nNote: {estimated} call(s) returned no token counts; those rows are estimates.")
+        flagged = sum(row["flagged_calls"] or 0 for row in rows)
+        if flagged:
+            lines.append(f"Note: {flagged} call(s) are flagged; see the flags column in the CSV export.")
         return "\n".join(lines)
 
     def print_report(self, by: Sequence[str] = ("model",), **filters: Any) -> None:
         print(self.report(by, **filters))
 
     def export_csv(self, path: str, **filters: Any) -> int:
-        """Write one CSV row per call. Returns how many calls were written."""
+        """Write one CSV row per call. Empty cells are unavailable numbers.
+        Returns how many calls were written."""
         rows = self.rows(**filters)
         with open(path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS, extrasaction="ignore")
@@ -591,31 +887,92 @@ class TokenMeter:
 
 # ------------------------------------------------------ ready-made callers
 #
-# Two small helpers so you can talk to a model with nothing installed. They
-# return the provider's JSON reply as a dict; pass them to `meter.measure`.
+# Small helpers so you can talk to a model with nothing installed. They return
+# the provider's reply; pass them to `meter.measure`.
 
-def post_json(url: str, payload: dict, headers: Optional[dict] = None, timeout: float = 600.0) -> dict:
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", **(headers or {})},
-        method="POST",
-    )
+def _http(request: urllib.request.Request, timeout: float) -> dict:
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:500]
         exc.close()
-        raise RuntimeError(f"HTTP {exc.code} from {url}: {detail}") from exc
+        raise RuntimeError(f"HTTP {exc.code} from {request.full_url}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"cannot reach {request.full_url} ({exc.reason}). "
+                           "Is the model server running, and is the address right?") from exc
 
 
-def ollama_chat(model: str, prompt: str, system: Optional[str] = None,
-                host: str = "http://localhost:11434", **options: Any) -> dict:
-    """One chat turn with a local Ollama model."""
+def post_json(url: str, payload: dict, headers: Optional[dict] = None, timeout: float = 600.0) -> dict:
+    return _http(urllib.request.Request(
+        url, data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", **(headers or {})}, method="POST",
+    ), timeout)
+
+
+def get_json(url: str, timeout: float = 10.0) -> dict:
+    return _http(urllib.request.Request(url, method="GET"), timeout)
+
+
+def ollama_chat(model: str, prompt: str, system: Optional[str] = None, host: str = "http://localhost:11434",
+                think: Any = None, timeout: float = 3600.0, **options: Any) -> dict:
+    """One chat turn with a local Ollama model.
+
+    think    True / False (or a level) for thinking models such as Qwen3.
+             Leave as None for models without thinking (Qwen2.5): Ollama
+             rejects the setting for them.
+    options  Ollama options, e.g. temperature=0.2, top_p=0.9, top_k=40,
+             seed=42, num_ctx=16384 (context window), num_predict=8192
+             (maximum output tokens).
+    """
     messages = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
-    return post_json(f"{host.rstrip('/')}/api/chat",
-                     {"model": model, "messages": messages, "stream": False, "options": options})
+    payload: dict = {"model": model, "messages": messages, "stream": False, "options": options}
+    if think is not None:
+        payload["think"] = think
+    return post_json(f"{host.rstrip('/')}/api/chat", payload, timeout=timeout)
+
+
+def ollama_gpu_percent(model: str, host: str = "http://localhost:11434") -> Optional[float]:
+    """Share of the loaded model that sits on the GPU (100 = fully offloaded,
+    0 = CPU only), from Ollama's list of running models. None if unknown."""
+    try:
+        running = get_json(f"{host.rstrip('/')}/api/ps").get("models") or []
+    except Exception:
+        return None
+    for entry in running:
+        if model in (entry.get("name"), entry.get("model")) and entry.get("size"):
+            return round(100.0 * _int(entry.get("size_vram")) / _int(entry["size"]), 1)
+    return None
+
+
+def ollama_model_info(model: str, host: str = "http://localhost:11434") -> dict:
+    """What exactly is being run: Ollama version, the model file's digest
+    (its hash), quantization, parameter size and current GPU offload.
+    Anything that cannot be read is reported as "unavailable"."""
+    base = host.rstrip("/")
+    info: dict = {"model": model, "ollama_version": UNAVAILABLE, "digest": UNAVAILABLE,
+                  "quantization_level": UNAVAILABLE, "parameter_size": UNAVAILABLE,
+                  "family": UNAVAILABLE, "format": UNAVAILABLE, "gpu_percent": UNAVAILABLE}
+    try:
+        info["ollama_version"] = get_json(f"{base}/api/version").get("version", UNAVAILABLE)
+    except Exception:
+        return info  # Ollama is not reachable
+    try:
+        for entry in get_json(f"{base}/api/tags").get("models") or []:
+            if model in (entry.get("name"), entry.get("model")):
+                info["digest"] = entry.get("digest", UNAVAILABLE)
+                info["size_bytes"] = entry.get("size", UNAVAILABLE)
+    except Exception:
+        pass
+    try:
+        details = post_json(f"{base}/api/show", {"model": model}, timeout=30).get("details") or {}
+        for key in ("quantization_level", "parameter_size", "family", "format"):
+            info[key] = details.get(key) or UNAVAILABLE
+    except Exception:
+        pass
+    gpu = ollama_gpu_percent(model, host)
+    info["gpu_percent"] = gpu if gpu is not None else "unavailable (model not loaded)"
+    return info
 
 
 def openai_compatible_chat(base_url: str, model: str, messages: list, api_key: Optional[str] = None,
@@ -625,6 +982,41 @@ def openai_compatible_chat(base_url: str, model: str, messages: list, api_key: O
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     return post_json(f"{base_url.rstrip('/')}/chat/completions",
                      {"model": model, "messages": messages, **params}, headers)
+
+
+def run_cli(command: Sequence[str], prompt: str, cwd: Optional[str] = None, timeout: float = 3600.0) -> str:
+    """Run a command-line AI tool, sending the prompt on standard input, and
+    return what it printed.
+
+    The prompt goes through standard input, not the command line, because
+    Windows cuts command lines at about 8,000 characters. The program is
+    looked up on PATH first, so `claude` finds `claude.cmd` on Windows.
+    """
+    program = shutil.which(command[0])
+    if program is None:
+        raise RuntimeError(f"`{command[0]}` is not installed or not on PATH")
+    try:
+        finished = subprocess.run([program, *command[1:]], input=prompt, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", cwd=cwd, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{command[0]} timed out after {exc.timeout:.0f} seconds") from exc
+    if finished.returncode != 0:
+        detail = (finished.stderr or finished.stdout or "").strip()[:500]
+        raise RuntimeError(f"{command[0]} exited with code {finished.returncode}: {detail}")
+    return finished.stdout
+
+
+def cli_version(program: str) -> str:
+    """What `<program> --version` prints, or "unavailable"."""
+    path = shutil.which(program)
+    if path is None:
+        return UNAVAILABLE
+    try:
+        finished = subprocess.run([path, "--version"], capture_output=True, text=True, encoding="utf-8",
+                                  errors="replace", timeout=30)
+    except Exception:
+        return UNAVAILABLE
+    return (finished.stdout or finished.stderr).strip().splitlines()[0] if (finished.stdout or finished.stderr).strip() else UNAVAILABLE
 
 
 # ----------------------------------------------------------------------- CLI
@@ -638,13 +1030,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report.add_argument("--by", nargs="+", default=["model"], choices=GROUP_COLUMNS, metavar="COLUMN",
                         help=f"group by any of: {', '.join(GROUP_COLUMNS)}")
     report.add_argument("--where", nargs="*", default=[], metavar="COLUMN=VALUE",
-                        help="only calls matching these, e.g. --where model=qwen3:14b round=2")
+                        help="only calls matching these, e.g. --where model=qwen3:30b round=2")
 
     export = commands.add_parser("export", help="write every call to a CSV file")
     export.add_argument("ledger")
     export.add_argument("csv")
 
+    budgets = commands.add_parser("budgets", help="show each token budget and what it has used")
+    budgets.add_argument("ledger")
+
+    configs = commands.add_parser("configs", help="print the saved model configuration records")
+    configs.add_argument("ledger")
+
     args = parser.parse_args(argv)
+    if hasattr(sys.stdout, "reconfigure"):  # never crash a report on a Windows console
+        sys.stdout.reconfigure(errors="replace")
     with TokenMeter(args.ledger) as meter:
         if args.command == "report":
             filters = {}
@@ -652,8 +1052,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 name, _, value = item.partition("=")
                 filters[name] = int(value) if name == "round" and value.lstrip("-").isdigit() else value
             meter.print_report(by=args.by, **filters)
-        else:
+        elif args.command == "export":
             print(f"wrote {meter.export_csv(args.csv)} calls to {args.csv}")
+        elif args.command == "budgets":
+            rows = meter.budgets()
+            if not rows:
+                print("No budgets in this ledger.")
+            for row in rows:
+                print(f"{row['name']}: used {row['used_tokens']:,} of {row['limit_tokens']:,} tokens "
+                      f"({row['remaining_tokens']:,} left, {row['calls']} calls)")
+        else:
+            print(json.dumps(meter.configs(), indent=2))
     return 0
 
 
